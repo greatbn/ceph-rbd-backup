@@ -7,30 +7,41 @@ import logging
 import sys
 import os
 import ConfigParser
+import requests
+
 
 
 ## Ceph credentials
 ceph_conf_prod = '/etc/ceph/ceph.conf'
-ceph_conf_backup = '/etc/ceph/ceph-backup.conf'
-ceph_keyring_prod = '/etc/ceph/ceph.client.rbd.keyring'
-ceph_keyring_backup = '/etc/ceph/ceph.client.rbd_backup.keyring'
-ceph_username_prod = 'rbd'
-ceph_username_backup = 'rbd_backup'
+ceph_conf_backup = '/etc/ceph-backup/ceph.conf'
+ceph_keyring_prod = '/etc/ceph/ceph.client.admin.keyring'
+ceph_keyring_backup = '/etc/ceph-backup/ceph.client.admin.keyring'
+ceph_username_prod = 'admin'
+ceph_username_backup = 'admin'
 ceph_snapshots_mount_path = '/mnt/ceph-snapshots'
 
 rbd_backup_conf = '/etc/ceph/ceph-rbd-backup.conf'
+ceph_prod_pool = 'SSD'
+ceph_backup_pool = 'backup'
 
 replication_lockfile_pattern = '/tmp/ceph-rbd-back-%s.lock'
 
+def notify(msg):
+    url = 'https://api.telegram.org/bot1109329413:AAFIvUc8kCoT4da1ATnE7ycQ-TZv2BQQCpQ/sendMessage'
+    body = {'chat_id':'-343794401', 'text': msg}
+    requests.post(url, body)
+
 class Rbd:
-  def __init__(self, config, keyring, username, noop=False):
+  def __init__(self, config, keyring, username, pool, noop=False):
     self.config = config
     self.keyring = keyring
     self.username = username
     self.noop = noop
+    self.pool = pool
 
   def _rbd_base_cmd(self, json=True):
-    return ['rbd', '-c', self.config, '--keyring', self.keyring, '--id', self.username] + (json and ['--format', 'json'] or [])
+    return ['rbd', '-c', self.config, '--keyring', self.keyring, '--id', self.username, '-p', self.pool] + (json and ['--format', 'json'] or [])
+
 
   def _rbd_exec_plain(self, *args):
     rbd_cmd = self._rbd_base_cmd(json=False) + list(args)
@@ -87,6 +98,15 @@ class Rbd:
   def snap_list(self, image_name):
     return self._rbd_exec_simple('snap', 'list', image_name)
 
+  def snap_purge(self, image_name):
+    return self._rbd_exec_noout('snap', 'purge', image_name)
+
+  def info(self, image_name):
+    return self._rbd_exec_simple('info', image_name)
+
+  def remove(self, image_name):
+    return self._rbd_exec_noout('rm', image_name)
+
   def snap_list_names(self, image_name):
     return [snap['name'] for snap in self.snap_list(image_name)]
 
@@ -97,7 +117,7 @@ class Rbd:
     self._rbd_exec_noout('snap', 'rm', image_name, '--snap', snap_name)
 
   def export_diff(self, image_name, snap_name, from_snap_name=None):
-    from_snap_args = from_snap_name and ['--from_snap', from_snap_name] or []
+    from_snap_args = from_snap_name and ['--from-snap', from_snap_name] or []
     return self._rbd_exec_pipe_source('export-diff', image_name, '-', '--snap', snap_name, *from_snap_args)
 
   def import_diff(self, image_name, source_pipe):
@@ -196,7 +216,7 @@ if __name__=="__main__":
 
   import argparse
   parser = argparse.ArgumentParser(description='Ceph backup / replication tool')
-  parser.add_argument('action', help='action to perform', choices=['replicate', 'snapshot', 'expire', 'mount', 'check'])
+  parser.add_argument('action', help='action to perform', choices=['replicate', 'snapshot', 'expire', 'mount', 'check', 'clean'])
   parser.add_argument('--image', help='single image to process instead of all')
   parser.add_argument('--debug', help='enable debug logging', action='store_true')
   parser.add_argument('--noop', help='don\'t do any action, only log', action='store_true')
@@ -212,34 +232,37 @@ if __name__=="__main__":
   else:
     logging.debug("No configuration found")
 
-  ceph_prod = Rbd(ceph_conf_prod, ceph_keyring_prod, ceph_username_prod, args.noop)
-  ceph_backup = Rbd(ceph_conf_backup, ceph_keyring_backup, ceph_username_backup, args.noop)
+  ceph_prod = Rbd(ceph_conf_prod, ceph_keyring_prod, ceph_username_prod, ceph_prod_pool, args.noop)
+  ceph_backup = Rbd(ceph_conf_backup, ceph_keyring_backup, ceph_username_backup, ceph_backup_pool, args.noop)
 
   if args.action == "snapshot":
-    volumes = [Volume(m['name'], m['device']) for m in ceph_prod.showmapped() if m['snap'] == '-']
+    volumes = ceph_prod.list()
     logging.info("Starting snapshot of all mounted volumes")
     errors = False
+
+    notify("Starting snapshot all volumes in the CEPH Cluster. Number of volumes: {}".format(len(volumes)))
     for volume in volumes:
-      if args.image and volume.image != args.image: continue
-      if not volume.mounted() and snapshot_mounted_only: continue
-      logging.info("Creating snapshot for volume '%s'" %(volume.image))
+      if args.image and volume != args.image: continue
+      logging.info("Creating snapshot for volume '%s'" %(volume))
       today = datetime.date.today().strftime("%Y-%m-%d")
-      if today in ceph_prod.snap_list_names(volume.image):
-        logging.error("Image '%s' already has snapshot '%s' - continuing with next image" %(volume.image, today))
+      if today in ceph_prod.snap_list_names(volume):
+        logging.error("Image '%s' already has snapshot '%s' - continuing with next image" %(volume, today))
         continue
       try:
-        if volume.mounted():
-          volume.freeze()
-        ceph_prod.snap_create(volume.image, today)
-        if volume.mounted():
-          volume.unfreeze()
+        #if volume.mounted():
+        #  volume.freeze()
+        ceph_prod.snap_create(volume, today)
+        #if volume.mounted():
+        #  volume.unfreeze()
       except VolumeException, e:
         logging.error(e.message + " - continuing with next volume")
         continue
     logging.info("Finished snapshot of all mounted volumes" + (errors and " (with errors)" or ""))
+    notify("Finished snapshot of all volumes today")
 
   elif args.action == "replicate":
     logging.info("Starting replication of images to destination")
+    notify("Starting replicate all volumes to CEPH Backup Cluster")
     for image in ceph_prod.list():
       if args.image and image != args.image: continue
       logging.info("Replicating image '%s'" %(image))
@@ -271,6 +294,7 @@ if __name__=="__main__":
         logging.info("Doing diff replication for image '%s'" %(image))
         ceph_backup.import_diff(image, ceph_prod.export_diff(image, latest_prd_snap, latest_bk_snap) )
       os.unlink(replication_lockfile_pattern %(image))
+    notify("Finish replicate all volumes to CEPH Backup Cluster") 
 
   elif args.action == "check":
     errors = []
@@ -298,10 +322,13 @@ if __name__=="__main__":
       sys.exit(2)
 
   elif args.action == "expire":
-    for image in ceph_prod.list():
+    notify("Starting remove old snapshot in SSD Cluster")
+    SSD_volume_list = ceph_prod.list()
+    backup_volume_list = ceph_backup.list()
+    for image in SSD_volume_list:
       if args.image and image != args.image: continue
       try:
-        prod_oldest_to_keep = (datetime.date.today() - datetime.timedelta(days=config.getint(image, 'prod_retention'))).strftime("%Y-%m-%d")
+        prod_oldest_to_keep = (datetime.date.today() - datetime.timedelta(days=config.getint('backup', 'prod_retention'))).strftime("%Y-%m-%d")
         prod_to_delete = [snap for snap in ceph_prod.snap_list_names(image) if snap < prod_oldest_to_keep]
       except ConfigParser.NoSectionError, ConfigParser.NoOptionError:
         logging.warn("No retention configured for image '%s' on prod - not removing snapshots" %(image))
@@ -309,11 +336,11 @@ if __name__=="__main__":
       for snap in prod_to_delete:
         logging.info("Deleting expired snapshot '%s' of image '%s' on prod" %(snap, image))
         ceph_prod.snap_rm(image, snap)
-      if image not in ceph_backup.list():
+      if image not in backup_volume_list:
         logging.warn("Missing image '%s' on backup cluster" %(image))
         continue
       try:
-        backup_oldest_to_keep = (datetime.date.today() - datetime.timedelta(days=config.getint(image, 'backup_retention'))).strftime("%Y-%m-%d")
+        backup_oldest_to_keep = (datetime.date.today() - datetime.timedelta(days=config.getint('backup', 'backup_retention'))).strftime("%Y-%m-%d")
         backup_to_delete = [snap for snap in ceph_backup.snap_list_names(image) if snap < backup_oldest_to_keep]
       except ConfigParser.NoSectionError, ConfigParser.NoOptionError:
         logging.info("No retention configured for image '%s' on backup - not removing snapshots" %(image))
@@ -321,13 +348,54 @@ if __name__=="__main__":
       for snap in backup_to_delete:
         logging.info("Deleting expired snapshot '%s' of image '%s' on backup" %(snap, image))
         ceph_backup.snap_rm(image, snap)
+   
+   
+    notify("Finished remove old snapshot in SSD Cluster")
+## Do delete image in backup cluster if that image is not existed in SSD cluster for 7 days
+  # get list deleted image
+  # Get the latest snapshot
+  # if the lastest snapshot = now - 7 days
+  elif args.action == "clean":
+    notify("Starting clean deleted volumes (in 7days) in Backup Cluster")
+    SSD_volume_list = ceph_prod.list()
+    backup_volume_list = ceph_backup.list()
+    deleted_volumes = []
+    for backup_vol in backup_volume_list:
+        if backup_vol not in SSD_volume_list and 'backup' not in backup_vol:
+            deleted_volumes.append(backup_vol)
+    notify("Found {} deleted volumes".format(len(deleted_volumes)))
+    need_clean_volumes = []
+    for vol in deleted_volumes:
+        print(vol)
+        snaps = ceph_backup.snap_list_names(vol)
+        print(snaps)
+	if snaps:
+            try:
+	        delta = datetime.datetime.now() - datetime.datetime.strptime(snaps[-1], '%Y-%m-%d')
+	        if delta.days > 7:
+                    need_clean_volumes.append(vol)
+            except:
+                # Truong hop backup manual
+                # bo qua truong hop nay
+                continue
+        else:
+            created_date = ceph_backup.info(vol)['create_timestamp']
+            delta = datetime.datetime.now() - datetime.datetime.strptime(created_date, '%a %b %d %H:%M:%S %Y')
+            if delta.days > 7:
+                need_clean_volumes.append(vol)
+    notify("Clean volume: {} in backup cluster".format(need_clean_volumes))
+    for vol in need_clean_volumes:
+        ceph_backup.snap_purge(vol)
+        ceph_backup.remove(vol)
+    notify("Finished clean volume in backup cluster")
+
 
   elif args.action == "mount":
     for image in ceph_prod.list():
       if args.image and image != args.image: continue
-      if not config.has_option(image, 'mount_snapshots'): continue
+      if not config.has_option('image', 'mount_snapshots'): continue
       logging.info("Checking snapshots mounts for image '%s'" %(image))
-      oldest_to_mount = (datetime.date.today() - datetime.timedelta(days=config.getint(image, 'mount_snapshots'))).strftime("%Y-%m-%d")
+      oldest_to_mount = (datetime.date.today() - datetime.timedelta(days=config.getint('image', 'mount_snapshots'))).strftime("%Y-%m-%d")
       # cleanup old mounted + dir
       snaps_dirs = os.listdir(os.path.join(ceph_snapshots_mount_path, image))
       print snaps_dirs
